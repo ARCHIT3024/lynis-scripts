@@ -1,0 +1,626 @@
+#!/bin/sh
+
+#################################################################################
+#
+#   Lynis
+# ------------------
+#
+# Copyright (c) Michael Boelen, CISOfy, and many contributors.
+#
+# Website  : https://cisofy.com
+# Blog     : https://linux-audit.com/
+# GitHub   : https://github.com/CISOfy/lynis
+#
+# Lynis comes with ABSOLUTELY NO WARRANTY. This is free software, and you are
+# welcome to redistribute it under the terms of the GNU General Public License.
+# See LICENSE file for usage of this software.
+#
+#################################################################################
+#
+# Mail server hardening (new test group, not part of upstream Lynis)
+#
+# Where tests_mail_messaging looks at the configuration of each mail daemon,
+# this group looks at what surrounds them:
+#   - aliases and .forward files (command execution, root mail)
+#   - mail spool, mailboxes and queue directories (confidentiality of mail)
+#   - TLS certificates of all mail services (expiry, key size, hostname)
+#   - mail protocols reachable over the network without encryption
+#   - mail logging, DKIM/DMARC and spam/virus filtering
+#
+# Run with: lynis audit system --tests-from-group mail_hardening
+#
+#################################################################################
+#
+    # Not translated yet, so fall back to English
+    InsertSection "${SECTION_MAIL_HARDENING:-Mail server hardening}"
+#
+#################################################################################
+#
+    MH_CERTIFICATES=""
+    MH_DOVECOT=0
+    MH_DOVECONFBINARY=""
+    MH_EXIM=0
+    MH_MTA_EXPOSED=0
+    MH_OPENSMTPD=0
+    MH_OPENSMTPD_CONF=""
+    MH_POSTFIX=0
+    MH_SENDMAIL=0
+#
+#################################################################################
+#
+    # Helper functions for this test group
+
+    # Permission bits for 'other' users of a file or directory (e.g. "r--"), symlinks are followed
+    MhOtherPerms() {
+        ${LSBINARY} -ldL "$1" 2> /dev/null | ${CUTBINARY} -c 8-10
+    }
+
+    # Owner of a file or directory
+    MhOwner() {
+        ${LSBINARY} -ldL "$1" 2> /dev/null | ${AWKBINARY} '{ print $3 }'
+    }
+
+    # Remember a certificate of a mail service ($1 = service, $2 = file)
+    MhAddCertificate() {
+        if [ -n "$2" -a -f "$2" ]; then
+            MH_CERTIFICATES="${MH_CERTIFICATES}${MH_CERTIFICATES:+ }$1|$2"
+            LogText "Result: found certificate for $1: $2"
+        fi
+    }
+#
+#################################################################################
+#
+    # Detect the mail software, so this group can run on its own (without tests_mail_messaging)
+    LogText "Test: detecting mail software for mail hardening tests"
+    if [ -n "${POSTCONFBINARY}" ]; then
+        FIND=$(${PSBINARY} ax | ${GREPBINARY} "master" | ${GREPBINARY} "postfix" | ${GREPBINARY} -v "grep")
+        if [ -n "${FIND}" ]; then MH_POSTFIX=1; fi
+    fi
+    if [ -n "${EXIMBINARY}" ]; then
+        if IsRunning "exim4" || IsRunning "exim"; then MH_EXIM=1; fi
+    fi
+    if IsRunning "sendmail"; then MH_SENDMAIL=1; fi
+    FIND=$(${PSBINARY} ax | ${GREPBINARY} -E "(/smtpd( |$)|smtpd: (\[priv\]|dispatcher|queue|scheduler))" | ${GREPBINARY} -v "postfix" | ${GREPBINARY} -v "grep")
+    if [ -n "${FIND}" ]; then MH_OPENSMTPD=1; fi
+    for FILE in /etc/smtpd.conf /etc/smtpd/smtpd.conf /etc/mail/smtpd.conf /usr/local/etc/smtpd.conf /usr/local/etc/mail/smtpd.conf; do
+        if [ -z "${MH_OPENSMTPD_CONF}" -a -f "${FILE}" ]; then MH_OPENSMTPD_CONF="${FILE}"; fi
+    done
+    if IsRunning "dovecot"; then
+        MH_DOVECOT=1
+        for DIR in /usr/bin /usr/sbin /usr/local/bin /usr/local/sbin; do
+            if [ -z "${MH_DOVECONFBINARY}" -a -x "${DIR}/doveconf" ]; then MH_DOVECONFBINARY="${DIR}/doveconf"; fi
+        done
+    fi
+    if [ ${MH_POSTFIX} -eq 1 -o ${MH_EXIM} -eq 1 -o ${MH_SENDMAIL} -eq 1 -o ${MH_OPENSMTPD} -eq 1 ]; then MH_MTA=1; else MH_MTA=0; fi
+    LogText "Result: postfix=${MH_POSTFIX} exim=${MH_EXIM} sendmail=${MH_SENDMAIL} opensmtpd=${MH_OPENSMTPD} dovecot=${MH_DOVECOT}"
+
+    # An MTA listening on another address than loopback receives mail from the network
+    if [ ${MH_MTA} -eq 1 ]; then
+        if [ -n "${SSBINARY}" ]; then
+            FIND=$(${SSBINARY} -ltnH 2> /dev/null | ${AWKBINARY} '{ print $4 }' | ${GREPBINARY} -E ':(25|465|587)$' | ${GREPBINARY} -vE '^(127\.|\[::1\]|::1)')
+        elif [ -n "${NETSTATBINARY}" ]; then
+            FIND=$(${NETSTATBINARY} -ltn 2> /dev/null | ${AWKBINARY} '{ print $4 }' | ${GREPBINARY} -E '[:.](25|465|587)$' | ${GREPBINARY} -vE '^(127\.|::1)')
+        else
+            FIND=""
+        fi
+        if [ -n "${FIND}" ]; then MH_MTA_EXPOSED=1; fi
+    fi
+#
+#################################################################################
+#
+    # Test        : MAIL-9010
+    # Description : Check mail aliases file
+    # Notes       : A writable aliases file allows adding "|command" aliases, which the MTA executes
+    MH_ALIASES=""
+    if [ ${MH_POSTFIX} -eq 1 ]; then
+        # alias_maps = hash:/etc/aliases, nis:mail.aliases
+        for ITEM in $(${POSTCONFBINARY} -xh alias_maps 2> /dev/null | ${TRBINARY} ',' ' '); do
+            FILE=$(echo "${ITEM}" | ${SEDBINARY} 's/^[a-z0-9_]*://')
+            if [ -f "${FILE}" ]; then MH_ALIASES="${MH_ALIASES}${MH_ALIASES:+ }${FILE}"; fi
+        done
+    fi
+    if [ -z "${MH_ALIASES}" ]; then
+        for FILE in /etc/aliases /etc/mail/aliases; do
+            if [ -z "${MH_ALIASES}" -a -f "${FILE}" ]; then MH_ALIASES="${FILE}"; fi
+        done
+    fi
+    if [ ${MH_MTA} -eq 1 -a -n "${MH_ALIASES}" ]; then PREQS_MET="YES"; else PREQS_MET="NO"; fi
+    Register --test-no MAIL-9010 --preqs-met ${PREQS_MET} --weight L --network NO --category security --description "Check mail aliases file"
+    if [ ${SKIPTEST} -eq 0 ]; then
+        for FILE in ${MH_ALIASES}; do
+            LogText "Test: checking aliases file ${FILE}"
+            Report "mail_aliases_file[]=${FILE}"
+
+            # Ownership and permissions
+            OWNER=$(MhOwner "${FILE}")
+            GROUPWRITE=$(${LSBINARY} -lL "${FILE}" 2> /dev/null | ${CUTBINARY} -c 6)
+            OTHERWRITE=$(MhOtherPerms "${FILE}" | ${CUTBINARY} -c 2)
+            if [ ! "${OWNER}" = "root" -o "${GROUPWRITE}" = "w" -o "${OTHERWRITE}" = "w" ]; then
+                LogText "Result: ${FILE} is owned by ${OWNER} and/or writable by group or others"
+                Display --indent 2 --text "- Aliases file permissions" --result "${STATUS_UNSAFE}" --color RED
+                ReportWarning "${TEST_NO}" "Mail aliases file can be changed by non-root users, which allows command execution by the MTA" "${FILE}" "text:Run chown root:root ${FILE} and chmod 644 ${FILE}"
+                AddHP 0 3
+            else
+                LogText "Result: ${FILE} is owned by root and only writable by root"
+                Display --indent 2 --text "- Aliases file permissions" --result "${STATUS_OK}" --color GREEN
+                AddHP 3 3
+            fi
+
+            # Mail for root should reach a person
+            FIND=$(${GREPBINARY} -E '^[[:space:]]*root[[:space:]]*:' "${FILE}")
+            if [ -z "${FIND}" ]; then
+                LogText "Result: no alias for root found in ${FILE}"
+                Display --indent 2 --text "- Alias for root" --result "${STATUS_NOT_FOUND}" --color YELLOW
+                ReportSuggestion "${TEST_NO}" "Forward mail for root to an administrator, so security notifications are read" "${FILE}" "text:Add 'root: admin@example.org' to ${FILE} and run newaliases"
+                AddHP 0 1
+            else
+                LogText "Result: alias for root found: ${FIND}"
+                Display --indent 2 --text "- Alias for root" --result "${STATUS_FOUND}" --color GREEN
+                AddHP 1 1
+            fi
+
+            # The database should be rebuilt after changing the source file
+            if [ -f "${FILE}.db" ] && [ "${FILE}" -nt "${FILE}.db" ]; then
+                LogText "Result: ${FILE} is newer than ${FILE}.db"
+                Display --indent 2 --text "- Aliases database up-to-date" --result "${STATUS_NO}" --color YELLOW
+                ReportSuggestion "${TEST_NO}" "Aliases file was changed after the database was built, so changes are not active" "${FILE}.db" "text:Run newaliases"
+            fi
+        done
+    fi
+#
+#################################################################################
+#
+    # Test        : MAIL-9012
+    # Description : Check aliases for deliveries to commands, files and include files
+    if [ ${MH_MTA} -eq 1 -a -n "${MH_ALIASES}" ]; then PREQS_MET="YES"; else PREQS_MET="NO"; fi
+    Register --test-no MAIL-9012 --preqs-met ${PREQS_MET} --weight L --network NO --category security --description "Check aliases for command and file deliveries"
+    if [ ${SKIPTEST} -eq 0 ]; then
+        for FILE in ${MH_ALIASES}; do
+            LogText "Test: searching ${FILE} for aliases that deliver to a command, file or include file"
+            # Targets starting with |, / or :include: (optionally quoted)
+            FIND=$(${GREPBINARY} -vE '^[[:space:]]*(#|$)' "${FILE}" | ${GREPBINARY} -E ':.*(^|[[:space:],"])(\||/|:include:)' | ${CUTBINARY} -d ':' -f1 | ${TRBINARY} -d ' \t' | ${SORTBINARY} -u | ${TRBINARY} '\n' ' ' | ${SEDBINARY} 's/ $//')
+            if [ -n "${FIND}" ]; then
+                LogText "Result: found aliases with a command, file or include target: ${FIND}"
+                Display --indent 2 --text "- Aliases with command/file targets" --result "${STATUS_FOUND}" --color YELLOW
+                for ALIAS in ${FIND}; do Report "mail_alias_command[]=${ALIAS}"; done
+                ReportSuggestion "${TEST_NO}" "Review aliases that run a command or write to a file, they are executed for every incoming message" "${FIND}" "text:Remove unused aliases from ${FILE} and run newaliases"
+                AddHP 1 2
+            else
+                LogText "Result: no aliases with a command, file or include target"
+                Display --indent 2 --text "- Aliases with command/file targets" --result "${STATUS_NONE}" --color GREEN
+                AddHP 2 2
+            fi
+        done
+    fi
+#
+#################################################################################
+#
+    # Test        : MAIL-9014
+    # Description : Check .forward files of users
+    if [ ${MH_MTA} -eq 1 ]; then PREQS_MET="YES"; else PREQS_MET="NO"; fi
+    Register --test-no MAIL-9014 --preqs-met ${PREQS_MET} --weight L --network NO --category security --description "Check .forward files of users"
+    if [ ${SKIPTEST} -eq 0 ]; then
+        LogText "Test: checking .forward files in home directories"
+        MH_FORWARD_UNSAFE=""
+        MH_FORWARD_COMMAND=""
+        MH_FORWARD_COUNT=0
+        # Home directories of root and regular users
+        HOMEDIRS=$(${AWKBINARY} -F: '$3 == 0 || $3 >= 1000 { if ($6 != "" && $6 != "/") print $6 }' /etc/passwd | ${SORTBINARY} -u)
+        for DIR in ${HOMEDIRS}; do
+            FILE="${DIR}/.forward"
+            if [ -f "${FILE}" ]; then
+                MH_FORWARD_COUNT=$((MH_FORWARD_COUNT + 1))
+                LogText "Result: found ${FILE}"
+                GROUPWRITE=$(${LSBINARY} -lL "${FILE}" 2> /dev/null | ${CUTBINARY} -c 6)
+                OTHERWRITE=$(MhOtherPerms "${FILE}" | ${CUTBINARY} -c 2)
+                if [ "${GROUPWRITE}" = "w" -o "${OTHERWRITE}" = "w" ]; then
+                    MH_FORWARD_UNSAFE="${MH_FORWARD_UNSAFE}${MH_FORWARD_UNSAFE:+ }${FILE}"
+                fi
+                FIND=$(${GREPBINARY} '|' "${FILE}")
+                if [ -n "${FIND}" ]; then
+                    MH_FORWARD_COMMAND="${MH_FORWARD_COMMAND}${MH_FORWARD_COMMAND:+ }${FILE}"
+                fi
+            fi
+        done
+        LogText "Result: found ${MH_FORWARD_COUNT} .forward file(s)"
+        if [ -n "${MH_FORWARD_UNSAFE}" ]; then
+            Display --indent 2 --text "- User .forward files" --result "${STATUS_UNSAFE}" --color RED
+            ReportWarning "${TEST_NO}" "Found .forward files that can be changed by other users, which allows reading mail or running commands as that user" "${MH_FORWARD_UNSAFE}" "text:Run chmod go-w on the file"
+            AddHP 0 2
+        elif [ -n "${MH_FORWARD_COMMAND}" ]; then
+            Display --indent 2 --text "- User .forward files" --result "COMMANDS" --color YELLOW
+            ReportSuggestion "${TEST_NO}" "Found .forward files that pipe mail to a command, check if they are still needed" "${MH_FORWARD_COMMAND}" "-"
+            AddHP 1 2
+        elif [ ${MH_FORWARD_COUNT} -gt 0 ]; then
+            Display --indent 2 --text "- User .forward files" --result "${STATUS_OK}" --color GREEN
+            AddHP 2 2
+        else
+            Display --indent 2 --text "- User .forward files" --result "${STATUS_NONE}" --color GREEN
+            AddHP 2 2
+        fi
+    fi
+#
+#################################################################################
+#
+    # Test        : MAIL-9020
+    # Description : Check mail spool directory and mailbox permissions
+    MH_SPOOL=""
+    for DIR in /var/mail /var/spool/mail; do
+        if [ -z "${MH_SPOOL}" -a -d "${DIR}" ]; then MH_SPOOL="${DIR}"; fi
+    done
+    if [ -n "${MH_SPOOL}" ]; then PREQS_MET="YES"; else PREQS_MET="NO"; fi
+    Register --test-no MAIL-9020 --preqs-met ${PREQS_MET} --weight L --network NO --category security --description "Check mail spool and mailbox permissions"
+    if [ ${SKIPTEST} -eq 0 ]; then
+        LogText "Test: checking permissions of mail spool ${MH_SPOOL}"
+        PERMS=$(MhOtherPerms "${MH_SPOOL}")
+        LogText "Result: permissions for others on ${MH_SPOOL}: ${PERMS}"
+        # World-writable is only acceptable together with the sticky bit (drwxrwxrwt)
+        case "${PERMS}" in
+            ?w[!tT])
+                Display --indent 2 --text "- Mail spool directory" --result "${STATUS_UNSAFE}" --color RED
+                ReportWarning "${TEST_NO}" "Mail spool directory is world-writable without sticky bit, users can delete or replace mailboxes of others" "${MH_SPOOL}" "text:Run chmod 2775 ${MH_SPOOL} and chown root:mail ${MH_SPOOL}"
+                AddHP 0 2
+                ;;
+            *)
+                Display --indent 2 --text "- Mail spool directory" --result "${STATUS_OK}" --color GREEN
+                AddHP 2 2
+                ;;
+        esac
+
+        LogText "Test: checking if mailboxes are readable by other users"
+        MH_MAILBOX_OPEN=""
+        MH_MAILBOX_OWNER=""
+        MH_MAILBOX_COUNT=0
+        for FILE in "${MH_SPOOL}"/*; do
+            if [ -f "${FILE}" ]; then
+                MH_MAILBOX_COUNT=$((MH_MAILBOX_COUNT + 1))
+                PERMS=$(MhOtherPerms "${FILE}")
+                case "${PERMS}" in
+                    r??|?w?) MH_MAILBOX_OPEN="${MH_MAILBOX_OPEN}${MH_MAILBOX_OPEN:+ }${FILE##*/}" ;;
+                esac
+                # The mailbox should be owned by the user with the same name
+                OWNER=$(MhOwner "${FILE}")
+                if [ ! "${OWNER}" = "${FILE##*/}" ]; then
+                    MH_MAILBOX_OWNER="${MH_MAILBOX_OWNER}${MH_MAILBOX_OWNER:+ }${FILE##*/}(${OWNER})"
+                fi
+            fi
+        done
+        LogText "Result: checked ${MH_MAILBOX_COUNT} mailbox(es)"
+        if [ -n "${MH_MAILBOX_OPEN}" ]; then
+            LogText "Result: mailboxes readable or writable by others: ${MH_MAILBOX_OPEN}"
+            Display --indent 2 --text "- Mailbox permissions" --result "${STATUS_UNSAFE}" --color RED
+            ReportWarning "${TEST_NO}" "Found mailboxes that can be read or changed by other users" "${MH_MAILBOX_OPEN}" "text:Run chmod 660 on the mailbox (owner user, group mail)"
+            AddHP 0 3
+        else
+            Display --indent 2 --text "- Mailbox permissions" --result "${STATUS_OK}" --color GREEN
+            AddHP 3 3
+        fi
+        if [ -n "${MH_MAILBOX_OWNER}" ]; then
+            LogText "Result: mailboxes not owned by the matching user: ${MH_MAILBOX_OWNER}"
+            Display --indent 2 --text "- Mailbox ownership" --result "${STATUS_DIFFERENT}" --color YELLOW
+            ReportSuggestion "${TEST_NO}" "Found mailboxes that are not owned by the user with the same name" "${MH_MAILBOX_OWNER}" "-"
+        fi
+    fi
+#
+#################################################################################
+#
+    # Test        : MAIL-9022
+    # Description : Check permissions of MTA queue directories
+    # Notes       : Queued messages contain the full mail, so other users should not be able to read them
+    MH_QUEUEDIRS=""
+    if [ ${MH_POSTFIX} -eq 1 ]; then
+        QDIR=$(${POSTCONFBINARY} -xh queue_directory 2> /dev/null)
+        for SUB in active bounce corrupt defer deferred flush hold incoming saved trace maildrop; do
+            if [ -d "${QDIR}/${SUB}" ]; then MH_QUEUEDIRS="${MH_QUEUEDIRS}${MH_QUEUEDIRS:+ }${QDIR}/${SUB}"; fi
+        done
+    fi
+    if [ ${MH_EXIM} -eq 1 ]; then
+        QDIR=$(${EXIMBINARY} -bP -n spool_directory 2> /dev/null)
+        if [ -d "${QDIR}" ]; then MH_QUEUEDIRS="${MH_QUEUEDIRS}${MH_QUEUEDIRS:+ }${QDIR}"; fi
+    fi
+    if [ ${MH_SENDMAIL} -eq 1 -a -d /var/spool/mqueue ]; then MH_QUEUEDIRS="${MH_QUEUEDIRS}${MH_QUEUEDIRS:+ }/var/spool/mqueue"; fi
+    if [ ${MH_OPENSMTPD} -eq 1 -a -d /var/spool/smtpd/queue ]; then MH_QUEUEDIRS="${MH_QUEUEDIRS}${MH_QUEUEDIRS:+ }/var/spool/smtpd/queue"; fi
+    if [ -n "${MH_QUEUEDIRS}" ]; then PREQS_MET="YES"; else PREQS_MET="NO"; fi
+    Register --test-no MAIL-9022 --preqs-met ${PREQS_MET} --weight L --network NO --category security --description "Check permissions of MTA queue directories"
+    if [ ${SKIPTEST} -eq 0 ]; then
+        MH_QUEUE_OPEN=""
+        for DIR in ${MH_QUEUEDIRS}; do
+            PERMS=$(MhOtherPerms "${DIR}")
+            LogText "Result: permissions for others on ${DIR}: ${PERMS}"
+            case "${PERMS}" in
+                r??|?w?) MH_QUEUE_OPEN="${MH_QUEUE_OPEN}${MH_QUEUE_OPEN:+ }${DIR}" ;;
+            esac
+        done
+        if [ -n "${MH_QUEUE_OPEN}" ]; then
+            Display --indent 2 --text "- MTA queue directories" --result "${STATUS_UNSAFE}" --color RED
+            ReportWarning "${TEST_NO}" "Mail queue directories are readable or writable by other users" "${MH_QUEUE_OPEN}" "text:Restore the default permissions (Postfix: postfix set-permissions)"
+            AddHP 0 3
+        else
+            Display --indent 2 --text "- MTA queue directories" --result "${STATUS_OK}" --color GREEN
+            AddHP 3 3
+        fi
+    fi
+#
+#################################################################################
+#
+    # Test        : MAIL-9030
+    # Description : Check TLS certificates of mail services (expiry, key size, signature, hostname)
+    if [ ${MH_POSTFIX} -eq 1 ]; then
+        if [ ! "$(${POSTCONFBINARY} -xh smtpd_tls_security_level 2> /dev/null)" = "none" ]; then
+            MhAddCertificate "postfix" "$(${POSTCONFBINARY} -xh smtpd_tls_cert_file 2> /dev/null)"
+        fi
+    fi
+    if [ ${MH_EXIM} -eq 1 ]; then
+        FILE=$(${EXIMBINARY} -bP -n tls_certificate 2> /dev/null | ${GREPBINARY} -v "is not a known option")
+        case "${FILE}" in
+            *'$'*) LogText "Result: Exim certificate is an expansion string, skipped" ;;
+            *) MhAddCertificate "exim" "${FILE}" ;;
+        esac
+    fi
+    if [ ${MH_DOVECOT} -eq 1 -a -n "${MH_DOVECONFBINARY}" ]; then
+        FILE=$(${MH_DOVECONFBINARY} -h ssl_cert 2> /dev/null | ${SEDBINARY} 's/^<//')
+        if [ -z "${FILE}" ]; then FILE=$(${MH_DOVECONFBINARY} -h ssl_server_cert_file 2> /dev/null); fi
+        MhAddCertificate "dovecot" "${FILE}"
+    fi
+    if [ ${MH_OPENSMTPD} -eq 1 -a -n "${MH_OPENSMTPD_CONF}" ]; then
+        for FILE in $(${AWKBINARY} '$1 == "pki" && $3 == "cert" { gsub(/"/, "", $4); print $4 }' "${MH_OPENSMTPD_CONF}"); do
+            MhAddCertificate "opensmtpd" "${FILE}"
+        done
+    fi
+    if [ -n "${MH_CERTIFICATES}" -a -n "${OPENSSLBINARY}" ]; then PREQS_MET="YES"; else PREQS_MET="NO"; fi
+    Register --test-no MAIL-9030 --preqs-met ${PREQS_MET} --weight L --network NO --category security --description "Check TLS certificates of mail services"
+    if [ ${SKIPTEST} -eq 0 ]; then
+        # Name the server is known by. Postfix knows it best, otherwise use the FQDN
+        MH_SERVERNAME=""
+        if [ ${MH_POSTFIX} -eq 1 ]; then MH_SERVERNAME=$(${POSTCONFBINARY} -xh myhostname 2> /dev/null); fi
+        if [ -z "${MH_SERVERNAME}" ]; then MH_SERVERNAME="${FQDN}"; fi
+        LogText "Result: expected name in certificates: ${MH_SERVERNAME}"
+        MH_SEEN=""
+        for ITEM in ${MH_CERTIFICATES}; do
+            SERVICE="${ITEM%%|*}"
+            FILE="${ITEM#*|}"
+            # Several services often share one certificate (e.g. via a symlink), check each certificate once
+            FINGERPRINT=$(${OPENSSLBINARY} x509 -noout -fingerprint -sha256 -in "${FILE}" 2> /dev/null | ${CUTBINARY} -d '=' -f2)
+            if [ -z "${FINGERPRINT}" ]; then
+                LogText "Result: ${FILE} could not be parsed as a certificate"
+                Display --indent 2 --text "- Certificate (${SERVICE})" --result "${STATUS_UNKNOWN}" --color YELLOW
+                continue
+            fi
+            case " ${MH_SEEN} " in
+                *" ${FINGERPRINT} "*)
+                    LogText "Result: ${FILE} (${SERVICE}) was already checked, skipping"
+                    continue
+                    ;;
+            esac
+            MH_SEEN="${MH_SEEN} ${FINGERPRINT}"
+            LogText "Test: checking certificate ${FILE} (${SERVICE})"
+            Report "mail_certificate[]=${SERVICE}|${FILE}"
+            CERTTEXT=$(${OPENSSLBINARY} x509 -noout -text -in "${FILE}" 2> /dev/null)
+            MH_ISSUES=""
+
+            # Expiry
+            if ! ${OPENSSLBINARY} x509 -noout -checkend 0 -in "${FILE}" > /dev/null 2>&1; then
+                LogText "Result: certificate has expired"
+                ReportWarning "${TEST_NO}" "TLS certificate of ${SERVICE} has expired" "${FILE}" "text:Renew the certificate"
+                MH_ISSUES="${MH_ISSUES}${MH_ISSUES:+, }expired"
+            elif ! ${OPENSSLBINARY} x509 -noout -checkend 2592000 -in "${FILE}" > /dev/null 2>&1; then
+                LogText "Result: certificate expires within 30 days"
+                ReportSuggestion "${TEST_NO}" "TLS certificate of ${SERVICE} expires within 30 days" "${FILE}" "text:Renew the certificate, or automate renewal (e.g. ACME)"
+                MH_ISSUES="${MH_ISSUES}${MH_ISSUES:+, }expires soon"
+            else
+                LogText "Result: certificate is valid for more than 30 days ($(${OPENSSLBINARY} x509 -noout -enddate -in "${FILE}" 2> /dev/null))"
+            fi
+
+            # RSA keys smaller than 2048 bits
+            FIND=$(echo "${CERTTEXT}" | ${GREPBINARY} 'Public Key Algorithm: rsaEncryption')
+            KEYBITS=$(echo "${CERTTEXT}" | ${GREPBINARY} -E 'Public-Key: \(' | ${SEDBINARY} 's/.*(\([0-9]*\) bit).*/\1/')
+            LogText "Result: key size ${KEYBITS} bits"
+            if [ -n "${FIND}" -a -n "${KEYBITS}" ] && [ "${KEYBITS}" -lt 2048 ]; then
+                ReportWarning "${TEST_NO}" "TLS certificate of ${SERVICE} uses a weak RSA key (${KEYBITS} bits)" "${FILE}" "text:Use an RSA key of at least 2048 bits or an EC key"
+                MH_ISSUES="${MH_ISSUES}${MH_ISSUES:+, }weak key"
+            fi
+
+            # Signature algorithm
+            FIND=$(echo "${CERTTEXT}" | ${GREPBINARY} -iE 'Signature Algorithm: (md5|sha1)')
+            if [ -n "${FIND}" ]; then
+                ReportSuggestion "${TEST_NO}" "TLS certificate of ${SERVICE} uses a weak signature algorithm (MD5 or SHA-1)" "${FILE}" "text:Request a certificate with a SHA-256 signature"
+                MH_ISSUES="${MH_ISSUES}${MH_ISSUES:+, }weak signature"
+            fi
+
+            # Self-signed certificates can not be verified by clients
+            SUBJECT=$(${OPENSSLBINARY} x509 -noout -subject -nameopt RFC2253 -in "${FILE}" 2> /dev/null | ${SEDBINARY} 's/^subject=//')
+            ISSUER=$(${OPENSSLBINARY} x509 -noout -issuer -nameopt RFC2253 -in "${FILE}" 2> /dev/null | ${SEDBINARY} 's/^issuer=//')
+            LogText "Result: subject=${SUBJECT} issuer=${ISSUER}"
+            if [ "${SUBJECT}" = "${ISSUER}" ]; then
+                ReportSuggestion "${TEST_NO}" "TLS certificate of ${SERVICE} is self-signed, clients can not verify it" "${FILE}" "text:Use a certificate from a trusted CA (e.g. Let's Encrypt)"
+                MH_ISSUES="${MH_ISSUES}${MH_ISSUES:+, }self-signed"
+            fi
+
+            # Hostname (OpenSSL 1.1.0 and later)
+            if [ -n "${MH_SERVERNAME}" ]; then
+                FIND=$(${OPENSSLBINARY} x509 -noout -checkhost "${MH_SERVERNAME}" -in "${FILE}" 2> /dev/null)
+                case "${FIND}" in
+                    *"does NOT match"*)
+                        LogText "Result: certificate does not match ${MH_SERVERNAME}"
+                        ReportSuggestion "${TEST_NO}" "TLS certificate of ${SERVICE} does not match the server name ${MH_SERVERNAME}" "${FILE}" "-"
+                        MH_ISSUES="${MH_ISSUES}${MH_ISSUES:+, }name mismatch"
+                        ;;
+                    *"does match"*)
+                        LogText "Result: certificate matches ${MH_SERVERNAME}"
+                        ;;
+                esac
+            fi
+
+            if [ -z "${MH_ISSUES}" ]; then
+                Display --indent 2 --text "- Certificate (${SERVICE})" --result "${STATUS_OK}" --color GREEN
+                AddHP 3 3
+            else
+                LogText "Result: issues with certificate ${FILE}: ${MH_ISSUES}"
+                case "${MH_ISSUES}" in
+                    *expired* | *"weak key"*)
+                        Display --indent 2 --text "- Certificate (${SERVICE})" --result "${STATUS_WARNING}" --color RED
+                        AddHP 0 3
+                        ;;
+                    *)
+                        Display --indent 2 --text "- Certificate (${SERVICE})" --result "${STATUS_SUGGESTION}" --color YELLOW
+                        AddHP 1 3
+                        ;;
+                esac
+            fi
+        done
+    fi
+#
+#################################################################################
+#
+    # Test        : MAIL-9040
+    # Description : Check for unencrypted mail protocols reachable over the network
+    # Notes       : Ports 110 (POP3) and 143 (IMAP) are plaintext, unless the client uses STARTTLS
+    if [ -n "${SSBINARY}" -o -n "${NETSTATBINARY}" ]; then PREQS_MET="YES"; else PREQS_MET="NO"; fi
+    Register --test-no MAIL-9040 --preqs-met ${PREQS_MET} --weight L --network NO --category security --description "Check for unencrypted mail protocols on the network"
+    if [ ${SKIPTEST} -eq 0 ]; then
+        LogText "Test: collecting listening mail ports (not on loopback)"
+        if [ -n "${SSBINARY}" ]; then
+            MH_LISTEN=$(${SSBINARY} -ltnH 2> /dev/null | ${AWKBINARY} '{ print $4 }')
+        else
+            MH_LISTEN=$(${NETSTATBINARY} -ltn 2> /dev/null | ${AWKBINARY} '$1 ~ /^tcp/ { print $4 }')
+        fi
+        MH_PORTS=$(echo "${MH_LISTEN}" | ${GREPBINARY} -vE '^(127\.|\[::1\]|::1)' | ${SEDBINARY} 's/.*[:.]//' | ${GREPBINARY} -E '^(25|110|143|465|587|993|995)$' | ${SORTBINARY} -n -u | ${TRBINARY} '\n' ' ' | ${SEDBINARY} 's/ $//')
+        LogText "Result: mail ports reachable from the network: ${MH_PORTS:-none}"
+        for PORT in ${MH_PORTS}; do Report "mail_listening_port[]=${PORT}"; done
+        Display --indent 2 --text "- Mail ports on network" --result "${MH_PORTS:-${STATUS_NONE}}" --color WHITE
+
+        MH_PLAIN=""
+        for PORT in ${MH_PORTS}; do
+            case "${PORT}" in
+                110) MH_PLAIN="${MH_PLAIN}${MH_PLAIN:+ }110/pop3" ;;
+                143) MH_PLAIN="${MH_PLAIN}${MH_PLAIN:+ }143/imap" ;;
+            esac
+        done
+        if [ -n "${MH_PLAIN}" ]; then
+            # With Dovecot ssl=required, clients must use STARTTLS before doing anything
+            MH_SSLREQ=""
+            if [ ${MH_DOVECOT} -eq 1 -a -n "${MH_DOVECONFBINARY}" ]; then MH_SSLREQ=$(${MH_DOVECONFBINARY} -h ssl 2> /dev/null); fi
+            if [ "${MH_SSLREQ}" = "required" ]; then
+                LogText "Result: plaintext ports open, but Dovecot requires STARTTLS (ssl = required)"
+                Display --indent 2 --text "- Unencrypted POP3/IMAP" --result "STARTTLS REQUIRED" --color GREEN
+                AddHP 2 2
+            else
+                LogText "Result: unencrypted POP3/IMAP ports reachable: ${MH_PLAIN}"
+                Display --indent 2 --text "- Unencrypted POP3/IMAP" --result "${STATUS_EXPOSED}" --color YELLOW
+                ReportSuggestion "${TEST_NO}" "POP3/IMAP without TLS is reachable from the network, prefer POP3S/IMAPS (995/993) or require STARTTLS" "${MH_PLAIN}" "text:Dovecot: set ssl = required, or disable the plaintext listeners (port = 0)"
+                AddHP 0 2
+            fi
+        else
+            AddHP 2 2
+        fi
+    fi
+#
+#################################################################################
+#
+    # Test        : MAIL-9050
+    # Description : Check mail log files
+    # Notes       : Mail logs are needed for incident handling, but contain personal data (addresses)
+    if [ ${MH_MTA} -eq 1 ]; then PREQS_MET="YES"; else PREQS_MET="NO"; fi
+    Register --test-no MAIL-9050 --preqs-met ${PREQS_MET} --weight L --network NO --category security --description "Check mail log files"
+    if [ ${SKIPTEST} -eq 0 ]; then
+        MH_LOGS=""
+        MH_LOGFILES="/var/log/mail.log /var/log/maillog /var/log/mail /var/log/exim4/mainlog /var/log/exim/main.log /var/log/exim_mainlog"
+        # Postfix 3.4 and later can log to a file directly
+        if [ ${MH_POSTFIX} -eq 1 ]; then
+            FILE=$(${POSTCONFBINARY} -xh maillog_file 2> /dev/null)
+            case "${FILE}" in
+                /dev/stdout | /dev/stderr) LogText "Result: Postfix logs to ${FILE}" ;;
+                "") ;;
+                *) MH_LOGFILES="${FILE} ${MH_LOGFILES}" ;;
+            esac
+        fi
+        for FILE in ${MH_LOGFILES}; do
+            case " ${MH_LOGS} " in
+                *" ${FILE} "*) ;;
+                *) if [ -f "${FILE}" ]; then MH_LOGS="${MH_LOGS}${MH_LOGS:+ }${FILE}"; fi ;;
+            esac
+        done
+        if [ -z "${MH_LOGS}" ]; then
+            LogText "Result: no mail log file found"
+            Display --indent 2 --text "- Mail log file" --result "${STATUS_NOT_FOUND}" --color YELLOW
+            ReportSuggestion "${TEST_NO}" "No mail log file found, make sure the MTA logs to syslog, journald or a file" "-" "text:Install a syslog daemon (e.g. rsyslog), or set maillog_file in Postfix"
+            AddHP 0 1
+        else
+            LogText "Result: found mail log file(s): ${MH_LOGS}"
+            Display --indent 2 --text "- Mail log file" --result "${STATUS_FOUND}" --color GREEN
+            AddHP 1 1
+            MH_LOGS_OPEN=""
+            for FILE in ${MH_LOGS}; do
+                Report "mail_log_file[]=${FILE}"
+                PERMS=$(MhOtherPerms "${FILE}" | ${CUTBINARY} -c 1)
+                if [ "${PERMS}" = "r" ]; then MH_LOGS_OPEN="${MH_LOGS_OPEN}${MH_LOGS_OPEN:+ }${FILE}"; fi
+            done
+            if [ -n "${MH_LOGS_OPEN}" ]; then
+                Display --indent 2 --text "- Mail log permissions" --result "${STATUS_UNSAFE}" --color YELLOW
+                ReportSuggestion "${TEST_NO}" "Mail log files are readable by all users and disclose who mails with whom" "${MH_LOGS_OPEN}" "text:Run chmod o-r on the log file and check the logrotate create mode"
+                AddHP 0 1
+            else
+                Display --indent 2 --text "- Mail log permissions" --result "${STATUS_OK}" --color GREEN
+                AddHP 1 1
+            fi
+        fi
+    fi
+#
+#################################################################################
+#
+    # Test        : MAIL-9060
+    # Description : Check for DKIM/DMARC and spam/virus filtering on an MTA that receives mail from the network
+    if [ ${MH_MTA_EXPOSED} -eq 1 ]; then PREQS_MET="YES"; else PREQS_MET="NO"; fi
+    Register --test-no MAIL-9060 --preqs-met ${PREQS_MET} --weight L --network NO --category security --description "Check for DKIM/DMARC and spam/virus filtering"
+    if [ ${SKIPTEST} -eq 0 ]; then
+        LogText "Test: searching for mail authentication (DKIM/DMARC) software"
+        MH_AUTH=""
+        for PROCESS in opendkim opendmarc rspamd; do
+            if IsRunning "${PROCESS}"; then MH_AUTH="${MH_AUTH}${MH_AUTH:+ }${PROCESS}"; fi
+        done
+        # Exim has DKIM built in, signing is enabled with dkim_domain on the smtp transport
+        if [ ${MH_EXIM} -eq 1 ]; then
+            FIND=$(${EXIMBINARY} -bP transport remote_smtp 2> /dev/null | ${GREPBINARY} -E '^[[:space:]]*dkim_domain = .+')
+            if [ -n "${FIND}" ]; then MH_AUTH="${MH_AUTH}${MH_AUTH:+ }exim-dkim"; fi
+        fi
+        if [ -n "${MH_AUTH}" ]; then
+            LogText "Result: found ${MH_AUTH}"
+            Display --indent 2 --text "- DKIM/DMARC" --result "${STATUS_FOUND}" --color GREEN
+            AddHP 2 2
+        else
+            LogText "Result: no DKIM signing or DMARC verification found"
+            Display --indent 2 --text "- DKIM/DMARC" --result "${STATUS_NOT_FOUND}" --color YELLOW
+            ReportSuggestion "${TEST_NO}" "No DKIM signing or DMARC verification found, mail from this domain is easier to spoof" "-" "text:Install OpenDKIM/OpenDMARC or rspamd, and publish SPF, DKIM and DMARC records in DNS"
+            AddHP 0 2
+        fi
+
+        LogText "Test: searching for spam and virus filtering"
+        MH_FILTER=""
+        for PROCESS in rspamd spamd amavisd amavisd-new clamd spampd; do
+            if IsRunning "${PROCESS}"; then MH_FILTER="${MH_FILTER}${MH_FILTER:+ }${PROCESS}"; fi
+        done
+        # Postfix: content filter or milters (e.g. a remote rspamd)
+        if [ ${MH_POSTFIX} -eq 1 ]; then
+            FIND=$(${POSTCONFBINARY} -xh smtpd_milters content_filter 2> /dev/null | ${GREPBINARY} -v '^$')
+            if [ -n "${FIND}" ]; then MH_FILTER="${MH_FILTER}${MH_FILTER:+ }postfix-filter"; fi
+        fi
+        if [ -n "${MH_FILTER}" ]; then
+            LogText "Result: found ${MH_FILTER}"
+            Display --indent 2 --text "- Spam/virus filtering" --result "${STATUS_FOUND}" --color GREEN
+            AddHP 2 2
+        else
+            LogText "Result: no spam or virus filtering found"
+            Display --indent 2 --text "- Spam/virus filtering" --result "${STATUS_NOT_FOUND}" --color YELLOW
+            ReportSuggestion "${TEST_NO}" "No spam or virus filtering found for incoming mail" "-" "text:Use rspamd, SpamAssassin or amavis with ClamAV"
+            AddHP 0 2
+        fi
+    fi
+#
+#################################################################################
+#
+
+WaitForKeyPress
+
+#
+#================================================================================
+# Lynis - Security Auditing and System Hardening for Linux and UNIX - https://cisofy.com
